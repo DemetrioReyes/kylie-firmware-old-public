@@ -145,6 +145,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
             if (cJSON_IsString(type)) {
                 if (strcmp(type->valuestring, "hello") == 0) {
                     ParseServerHello(root);
+                } else if (strcmp(type->valuestring, "ping") == 0) {
+                    // KylieAI keepalive: only refreshes last_incoming_time_ (set below)
                 } else {
                     if (on_incoming_json_ != nullptr) {
                         on_incoming_json_(root);
@@ -161,7 +163,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
     // Callbacks run on the transport's receive task, which on 4G modems is the
     // AT event task and cannot send, so the Pong is sent from the main task.
     std::weak_ptr<WebSocket> weak_websocket = websocket_;
-    websocket_->OnPing([weak_websocket](const char* data, size_t len) {
+    websocket_->OnPing([this, weak_websocket](const char* data, size_t len) {
+        last_incoming_time_ = std::chrono::steady_clock::now();  // KylieAI: WS ping = alive
         Application::GetInstance().Schedule([weak_websocket, payload = std::string(data, len)]() {
             if (auto websocket = weak_websocket.lock()) {
                 websocket->SendPong(payload.data(), payload.size());

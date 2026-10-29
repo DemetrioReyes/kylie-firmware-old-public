@@ -283,6 +283,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            kylie_link_.Tick();  // KylieAI: persistent channel supervisor
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -302,6 +303,7 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+    kylie_link_.OnNetwork(true);
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -328,6 +330,7 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    kylie_link_.OnNetwork(false);
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
@@ -366,6 +369,9 @@ void Application::HandleActivationDoneEvent() {
         display->ShowNotification(message.c_str());
         display->SetChatMessage("system", "");
     }
+
+    // KylieAI: start the persistent channel supervisor (needs ota_, released just below)
+    kylie_link_.Start(ota_->HasWebsocketConfig());
 
     // Release OTA object after activation is complete
     ota_.reset();
@@ -649,12 +655,15 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    kylie_link_.OnTtsStart(GetDeviceState());  // KylieAI: detect proactive speech
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        if (kylie_link_.OnTtsStop()) {
+                            // KylieAI: proactive speech, ended by KylieLink::Tick()
+                        } else if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -1391,6 +1400,9 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
+    if (kylie_link_.KeepAwake()) {  // KylieAI: companion device, never dim / deep-sleep
+        return false;
+    }
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
     }

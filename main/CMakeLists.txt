@@ -1173,6 +1173,8 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
         sdmmc
     )
 endif()
+# KylieAI: persistent channel patch (see KYLIE-NOTES.md)
+list(APPEND SOURCES "kylie/kylie_link.cc")
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}

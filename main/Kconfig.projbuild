@@ -1229,3 +1229,6 @@ menu "TAIJIPAI_S3_CONFIG"
 endmenu
 
 endmenu
+
+# KylieAI: persistent channel options
+rsource "kylie/Kconfig.kylie"

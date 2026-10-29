@@ -50,6 +50,10 @@ void Protocol::OnDisconnected(std::function<void()> callback) { on_disconnected_
 
 void Protocol::SetError(const std::string& message) {
     error_occurred_ = true;
+    if (silent_errors_) {
+        ESP_LOGW(TAG, "Silent network error: %s", message.c_str());
+        return;
+    }
     if (on_network_error_ != nullptr) {
         on_network_error_(message);
     }

@@ -1,0 +1,44 @@
+# KylieAI persistent-channel patch. Included from main/Kconfig.projbuild with a single rsource line.
+# See KYLIE-NOTES.md, section "Parche Kylie: canal persistente".
+
+menu "Kylie persistent channel"
+
+config KYLIE_PERSISTENT_CHANNEL
+    bool "Keep the WebSocket channel open while idle (proactive mode)"
+    default y
+    help
+        Open the WebSocket channel as soon as the device is activated and keep it open
+        in Idle, reconnecting with exponential backoff. Required for the server to push
+        reminders (tts start/frames/stop) without any user interaction.
+        Only effective when the OTA response selects the WebSocket transport.
+
+config KYLIE_RECONNECT_MAX_BACKOFF_S
+    int "Maximum reconnect delay in seconds"
+    depends on KYLIE_PERSISTENT_CHANNEL
+    range 2 600
+    default 60
+    help
+        Reconnect delays grow 1s, 2s, 4s, ... up to this value.
+
+config KYLIE_KEEP_AWAKE
+    bool "Never dim the screen or deep-sleep while the persistent channel is enabled"
+    depends on KYLIE_PERSISTENT_CHANNEL
+    default y
+    help
+        Companion-device mode: the board's PowerSaveTimer (screen dim after 60 s, deep
+        sleep after 290 s on this board) is held off. Costs battery: backlight and
+        Wi-Fi stay on. Disable to restore the stock timers (they then only run while
+        the channel is down, because stock CanEnterSleepMode() already refuses to sleep
+        with an open channel).
+
+config KYLIE_PROACTIVE_FOLLOWUP_S
+    int "Seconds to listen for a reply after a proactive (server-initiated) TTS"
+    depends on KYLIE_PERSISTENT_CHANNEL
+    range 0 60
+    default 0
+    help
+        0 returns to Idle when the proactive speech ends. N > 0 opens the microphone
+        (normal listening mode) for N seconds so the patient can answer; it then returns
+        to Idle unless the patient is speaking or the server starts another TTS.
+
+endmenu

@@ -131,7 +131,7 @@ Si NO se manda `challenge`, el aparato igual muestra el codigo pero hace 10 rein
 3. Cuidador reclama el codigo en el dashboard (`POST /devices/claim`, ya existe).
 4. `POST /xiaozhi/ota/activate` pasa de 202 a 200 -> el aparato re-consulta OTA -> sin `activation` -> modo normal (Idle). La primera conversacion abre el WS.
 
-### D. FIRMWARE (parche pendiente, NO hecho): modo proactivo
+### D. FIRMWARE: modo proactivo (IMPLEMENTADO, ver seccion 8; el texto de abajo es el plan original)
 
 Para que Kylie hable sin que nadie la active hace falta **canal WS persistente en reposo**. Estado actual: `WebsocketProtocol::Start()` no conecta y el canal se abre solo en `Application::ContinueOpenAudioChannel` / `ContinueWakeWordInvoke`. Plan de parche (rama `kylie`, en `main/application.cc` + `main/protocols/websocket_protocol.cc`):
 
@@ -141,7 +141,7 @@ Para que Kylie hable sin que nadie la active hace falta **canal WS persistente e
 4. Opcional en el mismo parche: aceptar `{"type":"wake"}` y `{"type":"display",...}` en `OnIncomingJson`; enviar `{"type":"state","battery":..,"charging":..}` periodico (la placa tiene `PowerManager` con nivel de bateria en `power_manager.h`).
 5. Consumo: canal abierto permanente aumenta gasto de bateria; el sleep de la placa (`PowerSaveTimer(-1,60,290)`: pantalla off a 60 s, deep sleep a 290 s sin cargar) **apagaria el aparato a los ~5 min** y mataria el modo proactivo; desactivar o relajar el shutdown cuando el canal persistente este activo o el aparato este cargando.
 
-Para el viernes (sin parche) el aparato solo funciona en modo reactivo: toque/BOOT/"Hi ESP" -> conversacion.
+Sin el parche el aparato solo funciona en modo reactivo (toque/BOOT/"Hi ESP"); con el parche de la seccion 8 mantiene el canal abierto.
 
 ---
 
@@ -201,3 +201,101 @@ git checkout kylie && git rebase main            # nuestros cambios son solo arc
 ```
 
 El clon local es superficial (`--depth 1`); `--unshallow` antes de integrar upstream. Tras cambiar de revision de ESP-IDF: `git submodule update --init --recursive` en `~/esp/esp-idf`, `source export.sh` y `idf.py fullclean`. Reglas del proyecto en `AGENTS.md`: no editar `sdkconfig*`, `managed_components/`, `build/`; no cambiar pines de una placa existente (identidad de board afecta OTA).
+
+---
+
+## 8. Parche Kylie: canal persistente
+
+Objetivo: que el aparato abra el WebSocket al terminar la activacion y lo mantenga abierto en reposo, para que el servidor pueda empujar recordatorios (`tts start` + frames + `tts stop`) sin interaccion del paciente. El flujo bajo demanda (toque, BOOT, "Hi ESP") no cambia: con el canal ya abierto, `HandleToggleChatEvent` / `BeginWakeWordInvoke` toman sus ramas de "canal ya abierto" que ya existian.
+
+### 8.1 Archivos y diff
+
+Codigo propio, archivos nuevos (sin conflicto al mezclar upstream):
+
+| Archivo | Contenido |
+|---|---|
+| `main/kylie/kylie_link.h/.cc` | Clase `KylieLink`: supervisor de conexion, backoff, tts proactivo, KeepAwake |
+| `main/kylie/Kconfig.kylie` | Opciones `CONFIG_KYLIE_*` |
+
+Hooks puntuales en archivos upstream (cada uno de 1 a 6 lineas):
+
+| Archivo | Cambio |
+|---|---|
+| `main/application.h` | `#include "kylie/kylie_link.h"`, `friend class KylieLink;`, miembro `KylieLink kylie_link_{*this};` |
+| `main/application.cc` | `kylie_link_.OnNetwork(true/false)` al inicio de `HandleNetworkConnected/DisconnectedEvent`; `kylie_link_.Start(ota_->HasWebsocketConfig())` en `HandleActivationDoneEvent` (antes de `ota_.reset()`); `kylie_link_.Tick()` en `MAIN_EVENT_CLOCK_TICK`; `OnTtsStart(GetDeviceState())` y `OnTtsStop()` en el handler `tts`; `CanEnterSleepMode()` devuelve false si `KeepAwake()` |
+| `main/protocols/protocol.h/.cc` | `SetSilentErrors(bool)`: mientras esta activo, `SetError()` solo loguea (los reintentos en segundo plano no disparan alerta ni sonido de error) |
+| `main/protocols/websocket_protocol.cc` | mensaje `{"type":"ping"}` aceptado como no-op (solo refresca el reloj de vida); el ping de control WS (`OnPing`) tambien lo refresca |
+| `main/CMakeLists.txt` | `list(APPEND SOURCES "kylie/kylie_link.cc")` justo antes de `idf_component_register` |
+| `main/Kconfig.projbuild` | una linea `rsource "kylie/Kconfig.kylie"` al final del archivo |
+
+Para rebasar sobre upstream basta resolver esos hunks; ninguno toca logica interna salvo los dos puntos del handler `tts`.
+
+### 8.2 Como funciona la reconexion
+
+`KylieLink::Tick()` corre cada 1 s en el main loop (evento `MAIN_EVENT_CLOCK_TICK`). Solo actua con el dispositivo en `Idle`: nunca interfiere con una conversacion, la configuracion Wi-Fi, una actualizacion o una notificacion.
+
+1. **Arranque**: al terminar la activacion (`HandleActivationDoneEvent`), si la respuesta OTA eligio WebSocket y hay `websocket/url` en NVS, el supervisor se habilita y el primer intento sale en el siguiente tick. Si el OTA eligio MQTT queda deshabilitado (el firmware se comporta como stock).
+2. **Intento**: `OpenAudioChannel()` con errores silenciados. Exito -> el canal queda abierto en `Idle`, Wi-Fi en modo PERFORMANCE (lo hace el callback `OnAudioChannelOpened` existente). Fallo -> `failures++` y proximo intento tras `min(2^failures s, 60 s)`: 1, 2, 4, 8, 16, 32, 60, 60...
+3. **Caida detectada** (el supervisor ve en `Idle` que `IsAudioChannelOpened()` pasa a falso): servidor cerro, 120 s sin trafico, el usuario termino la conversacion (que cierra el canal), cambio de AEC, etc. Cierra el socket viejo y reintenta tras 1 s. Si la conexion duro menos de 30 s cuenta como fallo y el backoff sigue creciendo (anti bucle caliente, p.ej. dos aparatos con la misma key y el gateway cerrando con 4000); si duro >= 30 s el backoff se reinicia.
+4. **Wi-Fi**: al caer la red en `Idle` se cierra el canal; mientras no haya red no se intenta. Al volver, backoff a cero y primer intento 1.5 s despues.
+5. **Toque durante la espera**: el flujo estandar abre el canal con su propio camino (con alerta si falla); el supervisor detecta que ya esta abierto y no hace nada.
+6. Un intento puede bloquear el main loop hasta ~10 s (timeout TCP) + 10 s (espera de hello) si el host no responde. Con servidor caido (RST inmediato) es instantaneo. Es el mismo comportamiento del camino bajo demanda.
+
+Constantes configurables: `CONFIG_KYLIE_RECONNECT_MAX_BACKOFF_S` (60). Estable = 30 s y el paso de 1 s son constantes en `kylie_link.cc`.
+
+### 8.3 Liveness
+
+Cualquier frame entrante (texto o binario, incluido `{"type":"ping"}` y ahora tambien el ping de control WebSocket) refresca `last_incoming_time_`. Si pasan mas de 120 s sin nada, `IsAudioChannelOpened()` devuelve falso (logica upstream, `Protocol::IsTimeout`) y el supervisor reconecta como en 8.2.3. El servidor debe mandar `{"type":"ping"}` cada 30-45 s. Sin keepalive del servidor el aparato reconecta cada ~2 min (funciona, pero no es lo deseado).
+
+### 8.4 Audio proactivo
+
+Comportamiento del firmware stock con `tts` fuera de sesion (verificado en codigo): `tts start` hace `SetDeviceState(Speaking)` desde cualquier estado (Idle->Speaking es transicion valida); el audio binario solo se encola en estado Speaking; `tts stop` pasa a `Listening` (o a `Idle` en modo manual), lo que dejaria el microfono abierto indefinidamente tras un recordatorio. Ajuste:
+
+- `OnTtsStart(estado_previo)`: si el aparato estaba en `Idle` la voz es proactiva. Pantalla, estado "Hablando" y reproduccion salen del flujo normal de `Speaking`. La pantalla ya esta encendida (ver 8.5).
+- `OnTtsStop()` en una voz proactiva: no pasa a `Listening`. Espera a que la cola de reproduccion se vacie (`IsPlaybackIdle`, comprobado en el tick, hasta 1 s de latencia) y entonces vuelve a `Idle` (reactiva la wake word). Con `CONFIG_KYLIE_PROACTIVE_FOLLOWUP_S = N > 0` abre en cambio el microfono N segundos para que el paciente conteste; al vencer vuelve a `Idle` (envia `listen stop`), salvo que el paciente este hablando (se extiende 5 s) o el servidor inicie otro `tts` (cancela el temporizador). Por defecto 0.
+- Dos segmentos seguidos (`stop` y luego otro `start` antes del drenaje) siguen contando como proactivos.
+- La wake word AFE sigue activa durante `Speaking`, asi que "Hi ESP" o un toque interrumpen un recordatorio (`AbortSpeaking`).
+
+Carrera conocida (igual que en el flujo normal): el estado cambia a `Speaking` en el main loop; frames binarios que lleguen antes de esa transicion se descartan, y `ResetDecoder()` en la entrada a `Speaking` vacia lo ya encolado. Recomendacion al gateway: esperar ~150-300 ms entre `tts start` y el primer frame.
+
+### 8.5 Apagado / pantalla y bateria (decision de compromiso)
+
+Hallazgos en el codigo: la placa crea `PowerSaveTimer(-1, 60, 290)` y NUNCA llama `WakeUp()`: tras 60 s en reposo atenua la pantalla (brillo 1) y a los 290 s hace `esp_deep_sleep_start()`; una vez atenuada no se restaura salvo al enchufar el cargador. El stock `CanEnterSleepMode()` ya devuelve falso con el canal abierto, asi que con un canal sano ya no dormiria, pero con el canal caido (servidor reiniciando) atenuaria y apagaria el aparato justo cuando no puede recibir recordatorios, y sin forma de despertarlo.
+
+Decision: `CONFIG_KYLIE_KEEP_AWAKE=y` (por defecto) -> `CanEnterSleepMode()` falso siempre que el canal persistente este habilitado: **sin atenuar pantalla y sin deep sleep**. Aparato "siempre encendido" para v1.
+
+Coste de bateria (ordenes de magnitud, SIN MEDIR en placa): Wi-Fi activo permanente en modo PERFORMANCE (sin modem sleep) ~80-120 mA, retroiluminacion ~20-40 mA, resto ~20 mA: del orden de 150 mA. Con una bateria tipica de 500-1000 mAh eso son horas, no dias; el aparato esta pensado para estar en el cargador. Palancas para v2 (no implementadas): (a) `PowerSaveLevel::LOW_POWER` (modem sleep) en `Idle` y PERFORMANCE solo durante conversacion (el ping cada 30-45 s y recordatorios toleran el retardo de DTIM, ~100-300 ms); (b) atenuar pantalla en reposo y restaurarla al llegar `tts start`/toque (requiere `WakeUp()` en la placa); (c) apagar la pantalla de noche.
+
+Para volver al comportamiento stock de ahorro: `CONFIG_KYLIE_KEEP_AWAKE=n` (o `CONFIG_KYLIE_PERSISTENT_CHANNEL=n` para quitar todo el parche). El usuario tambien puede desactivar el temporizador desde la pagina de configuracion Wi-Fi (campo de sleep, NVS `wifi/sleep_mode`).
+
+### 8.6 Opciones (menuconfig o `sdkconfig_append` en `kylie.json`)
+
+| Opcion | Default | Efecto |
+|---|---|---|
+| `CONFIG_KYLIE_PERSISTENT_CHANNEL` | y | Todo el parche (n = comportamiento stock; los hooks quedan inertes) |
+| `CONFIG_KYLIE_RECONNECT_MAX_BACKOFF_S` | 60 | Tope del backoff |
+| `CONFIG_KYLIE_KEEP_AWAKE` | y | Sin dim ni deep sleep |
+| `CONFIG_KYLIE_PROACTIVE_FOLLOWUP_S` | 0 | Segundos de escucha tras una voz proactiva |
+
+Ejemplo: en `scripts/kylie-build.sh`, agregar `"CONFIG_KYLIE_PROACTIVE_FOLLOWUP_S=15"` a `sdkconfig_append`.
+
+### 8.7 Requisitos del gateway para que funcione
+
+1. `{"type":"ping"}` cada 30-45 s por conexion abierta (tambien vale un `llm` o cualquier JSON con `type`; el firmware solo exige trafico).
+2. Para recordatorios: `tts start`, ~150-300 ms de margen, frames Opus 16 kHz/60 ms, `tts stop`. No hace falta `wake`. Opcional `llm` con emocion antes de hablar.
+3. No cerrar el WebSocket al terminar una conversacion: el aparato ahora lo mantiene y, si lo cierran, reconecta en 1 s con un hello nuevo.
+4. Un solo socket por aparato: un hello nuevo con la misma key hace que el gateway cierre el anterior (4000); si hubiera dos aparatos con la misma key se entrarian en bucle (el backoff lo amortigua).
+
+### 8.8 Riesgos a probar en placa
+
+1. Primera conexion tras activar: log `KylieLink: Persistent channel open` y en el gateway un hello sin interaccion. Estado en pantalla: reposo normal (no "Conectando").
+2. Reposo > 3 min con `ping` del servidor: el canal no debe caer (log sin `Channel down`). Sin ping: reconexion cada ~2 min.
+3. Matar el contenedor y levantarlo: backoff 1,2,4... sin alertas ni sonidos; reconecta solo al volver.
+4. Apagar y encender el router/Wi-Fi: cierre en `Idle`, reconexion 1.5 s despues de volver la red.
+5. Recordatorio proactivo en reposo: pantalla muestra "Hablando", suena completo (verificar que no se pierdan los primeros frames) y vuelve a "En espera" con la wake word activa. Comprobar tambien que el altavoz no dispara la wake word al terminar.
+6. Interrupcion de un recordatorio con toque / "Hi ESP".
+7. Conversacion normal con el canal persistente: toque -> escucha -> respuesta; terminar con toque (cierra el canal) -> reconecta a 1 s. Verificar que no queda microfono abierto tras terminar.
+8. Dos recordatorios seguidos (segundo `tts start` poco despues del primer `stop`).
+9. Pantalla encendida de forma permanente: temperatura/consumo en el cargador; backlight a brillo constante (riesgo de calentamiento y desgaste a largo plazo).
+10. Bloqueo del main loop hasta ~20 s durante un intento contra un host que no responde (toque diferido); probar apagando la IP del Mac sin tumbar el Wi-Fi.
+11. Con `CONFIG_KYLIE_PROACTIVE_FOLLOWUP_S>0`: respuesta del paciente tras el recordatorio, y regreso a reposo si calla.

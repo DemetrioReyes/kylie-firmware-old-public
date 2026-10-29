@@ -20,6 +20,7 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
+#include "kylie/kylie_link.h"  // KylieAI patch
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -127,6 +128,9 @@ public:
     void ResetProtocol();
 
 private:
+    friend class KylieLink;  // KylieAI patch: persistent channel supervisor
+    KylieLink kylie_link_{*this};
+
     Application();
     ~Application();
 
